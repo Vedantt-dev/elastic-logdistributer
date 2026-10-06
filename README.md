@@ -355,6 +355,28 @@ Full reset, which deletes indices and the Logstash queue:
 docker compose down -v
 ```
 
+## Restarting for a demo
+
+1. Open Docker Desktop and wait for **Engine running**.
+2. Start the stack. No rebuild is needed after the first run:
+
+```bash
+docker compose up -d
+```
+
+3. Check every stage:
+
+```bash
+./scripts/verify.sh
+```
+
+4. Start the stack **10–15 minutes before presenting**. The dashboard shows the last 15 minutes, and one full cycle of scenarios takes about 9 minutes.
+5. When you're done, stop it and keep the data:
+
+```bash
+docker compose stop
+```
+
 ## Troubleshooting
 
 | Symptom | Fix |
