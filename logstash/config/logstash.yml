@@ -1,0 +1,28 @@
+# Logstash node settings (mounted read-only into the container)
+http.host: "0.0.0.0"
+http.port: 9600
+
+# Plain field names (status_code, service, ...) instead of ECS-namespaced ones.
+pipeline.ecs_compatibility: disabled
+
+# Throughput tuning for a laptop: 2 worker threads, 250-event batches.
+pipeline.workers: 2
+pipeline.batch.size: 250
+pipeline.batch.delay: 50
+
+# Persistent queue: events are written to disk between input and filter stages.
+# If Elasticsearch slows down, the queue fills, Logstash stops pulling from Kafka,
+# and the backlog stays safely in Kafka as consumer lag (end-to-end backpressure).
+queue.type: persisted
+queue.max_bytes: 256mb
+queue.checkpoint.writes: 1024
+
+# Events that Elasticsearch rejects (e.g. mapping conflicts) go to the on-disk DLQ.
+dead_letter_queue.enable: true
+dead_letter_queue.max_bytes: 128mb
+
+config.reload.automatic: true
+config.reload.interval: 5s
+
+xpack.monitoring.enabled: false
+log.level: info

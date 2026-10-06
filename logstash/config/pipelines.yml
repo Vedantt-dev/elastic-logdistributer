@@ -1,0 +1,2 @@
+- pipeline.id: telemetry-ingest
+  path.config: "/usr/share/logstash/pipeline/pipeline.conf"

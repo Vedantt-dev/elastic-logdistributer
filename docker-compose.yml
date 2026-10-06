@@ -1,0 +1,305 @@
+# =============================================================================
+# QuickBite distributed telemetry pipeline (BDA mini-project)
+#
+#   producer (Python, multi-threaded)  ->  Kafka (KRaft, 6 partitions)
+#     ->  Logstash (classify / enrich / mask)  ->  Elasticsearch (daily indices)
+#     ->  Kibana (Command Center dashboard)
+#
+# Start everything:   docker compose up -d --build
+# Memory budget:      ~5.5 GB total (give Docker Desktop at least 6 GB)
+# =============================================================================
+
+name: bda-telemetry
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "2"
+
+x-elastic-version: &elastic-version "8.15.3"
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # Streaming buffer: single-node Kafka in KRaft mode (no ZooKeeper)
+  # ---------------------------------------------------------------------------
+  kafka:
+    image: apache/kafka:3.8.0
+    container_name: kafka
+    hostname: kafka
+    ports:
+      - "9092:9092"          # host clients (producer.py run locally, CLI tools)
+    environment:
+      CLUSTER_ID: "MkU3OEVBNTcwNTJENDM2Qk"
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: "broker,controller"
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka:9093"
+      KAFKA_LISTENERS: "INTERNAL://0.0.0.0:29092,EXTERNAL://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093"
+      KAFKA_ADVERTISED_LISTENERS: "INTERNAL://kafka:29092,EXTERNAL://localhost:9092"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT"
+      KAFKA_INTER_BROKER_LISTENER_NAME: "INTERNAL"
+      KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+      KAFKA_LOG_DIRS: "/tmp/kraft-combined-logs"
+      KAFKA_NUM_PARTITIONS: 6
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_LOG_RETENTION_HOURS: 6
+      KAFKA_LOG_RETENTION_BYTES: 1073741824
+      KAFKA_LOG_SEGMENT_BYTES: 134217728
+      KAFKA_HEAP_OPTS: "-Xms384m -Xmx512m"
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server kafka:29092 > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1g
+    logging: *default-logging
+    restart: unless-stopped
+
+  # One-shot: create the partitioned topic before anyone produces/consumes
+  kafka-init:
+    image: apache/kafka:3.8.0
+    container_name: kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 --create --if-not-exists \
+          --topic platform.telemetry.v1 --partitions 6 --replication-factor 1 \
+          --config retention.ms=21600000 \
+          --config cleanup.policy=delete \
+          --config compression.type=producer \
+          --config min.insync.replicas=1
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 --describe --topic platform.telemetry.v1
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 384m
+    logging: *default-logging
+    restart: "no"
+
+  # Web UI to browse topics, partitions, messages and consumer-group lag
+  kafka-ui:
+    image: provectuslabs/kafka-ui:v0.7.2
+    container_name: kafka-ui
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: "bda-local"
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: "kafka:29092"
+      DYNAMIC_CONFIG_ENABLED: "false"
+      JAVA_OPTS: "-Xms128m -Xmx256m"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 448m
+    logging: *default-logging
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Storage + distributed indexing: single-node Elasticsearch
+  # ---------------------------------------------------------------------------
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.15.3
+    container_name: elasticsearch
+    hostname: elasticsearch
+    ports:
+      - "9200:9200"
+    environment:
+      cluster.name: "bda-telemetry"
+      node.name: "es-node-1"
+      discovery.type: "single-node"
+      # Security is disabled ONLY because this is a local, single-user lab stack.
+      xpack.security.enabled: "false"
+      xpack.security.enrollment.enabled: "false"
+      xpack.ml.enabled: "false"
+      xpack.watcher.enabled: "false"
+      cluster.routing.allocation.disk.threshold_enabled: "false"
+      action.destructive_requires_name: "true"
+      ES_JAVA_OPTS: "-Xms1g -Xmx1g"
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    volumes:
+      - es-data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs 'http://localhost:9200/_cluster/health?wait_for_status=yellow&timeout=5s' > /dev/null"]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.5"
+          memory: 2g
+    logging: *default-logging
+    restart: unless-stopped
+
+  # One-shot: ILM policy + index templates (must exist before the first document)
+  es-setup:
+    image: python:3.12-slim
+    container_name: es-setup
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    environment:
+      ES_URL: "http://elasticsearch:9200"
+      TELEMETRY_RETENTION: "3d"
+    volumes:
+      - ./setup:/setup:ro
+    command: ["python", "/setup/bootstrap.py", "elasticsearch"]
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 128m
+    logging: *default-logging
+    restart: "no"
+
+  # ---------------------------------------------------------------------------
+  # Stream ingestion + enrichment
+  # ---------------------------------------------------------------------------
+  logstash:
+    image: docker.elastic.co/logstash/logstash:8.15.3
+    container_name: logstash
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      es-setup:
+        condition: service_completed_successfully
+    ports:
+      - "9600:9600"          # monitoring API: /_node/stats/pipelines
+    environment:
+      LS_JAVA_OPTS: "-Xms512m -Xmx512m"
+    volumes:
+      - ./logstash/config/logstash.yml:/usr/share/logstash/config/logstash.yml:ro
+      - ./logstash/config/pipelines.yml:/usr/share/logstash/config/pipelines.yml:ro
+      - ./logstash/pipeline:/usr/share/logstash/pipeline:ro
+      - logstash-data:/usr/share/logstash/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:9600/_node/pipelines > /dev/null"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1g
+    logging: *default-logging
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Visualisation
+  # ---------------------------------------------------------------------------
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.15.3
+    container_name: kibana
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    ports:
+      - "5601:5601"
+    environment:
+      SERVER_NAME: "kibana"
+      ELASTICSEARCH_HOSTS: '["http://elasticsearch:9200"]'
+      XPACK_ENCRYPTEDSAVEDOBJECTS_ENCRYPTIONKEY: "bda-telemetry-local-encryption-key-0001"
+      XPACK_REPORTING_ENCRYPTIONKEY: "bda-telemetry-local-reporting-key-000001"
+      XPACK_SECURITY_ENCRYPTIONKEY: "bda-telemetry-local-security-key-0000001"
+      TELEMETRY_OPTIN: "false"
+      TELEMETRY_ALLOWCHANGINGOPTINSTATUS: "false"
+      NODE_OPTIONS: "--max-old-space-size=900"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:5601/api/status | grep -q '\"level\":\"available\"'"]
+      interval: 15s
+      timeout: 10s
+      retries: 40
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1280m
+    logging: *default-logging
+    restart: unless-stopped
+
+  # One-shot: data views, Lens visualisations, saved search and the dashboard
+  kibana-setup:
+    image: python:3.12-slim
+    container_name: kibana-setup
+    depends_on:
+      kibana:
+        condition: service_healthy
+      es-setup:
+        condition: service_completed_successfully
+    environment:
+      KIBANA_URL: "http://kibana:5601"
+      KIBANA_PUBLIC_URL: "http://localhost:5601"
+      KIBANA_VERSION: *elastic-version
+    volumes:
+      - ./setup:/setup:ro
+    command: ["python", "/setup/bootstrap.py", "kibana"]
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 128m
+    logging: *default-logging
+    restart: "no"
+
+  # ---------------------------------------------------------------------------
+  # Producers: the multi-service traffic simulator
+  # ---------------------------------------------------------------------------
+  producer:
+    build:
+      context: ./producer
+    image: bda-telemetry/producer:latest
+    container_name: producer
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+    environment:
+      KAFKA_BOOTSTRAP: "kafka:29092"
+      KAFKA_TOPIC: "platform.telemetry.v1"
+      JOURNEY_RATE: "8"
+      GENERATOR_THREADS: "2"
+      PHASE_SCALE: "1.0"
+      TIME_SCALE: "0.02"
+      MALFORMED_RATE: "0.001"
+      REPORT_INTERVAL: "10"
+      # Set to a scenario name (e.g. upi_timeout_spike) to pin it instead of cycling.
+      PIN_SCENARIO: ""
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 256m
+    logging: *default-logging
+    restart: unless-stopped
+
+volumes:
+  es-data:
+  logstash-data:
